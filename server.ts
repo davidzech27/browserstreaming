@@ -48,8 +48,21 @@ const QUALITY_TIERS: Record<string, StreamQuality> = {
   },
 };
 
-// Store active contexts per connection
-const contexts = new Map<string, { context: BrowserContext; page: Page; cdp: CDPSession }>();
+// Browser session interface
+interface BrowserSession {
+  sessionId: string;
+  connectionId: string;
+  context: BrowserContext;
+  page: Page;
+  cdp: CDPSession;
+  currentTier: string;
+}
+
+// Store all active sessions by sessionId
+const sessions = new Map<string, BrowserSession>();
+
+// Track which sessions belong to which connection
+const connectionSessions = new Map<string, Set<string>>();
 
 // Shared browser instance
 let sharedBrowser: Browser | null = null;
@@ -80,6 +93,156 @@ async function shutdown() {
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+// Helper function to normalize and validate URLs
+function normalizeUrl(url: string): string {
+  let normalized = url.trim();
+
+  // If no protocol specified, add https://
+  if (!normalized.match(/^[a-zA-Z][a-zA-Z\d+\-.]*:/)) {
+    normalized = 'https://' + normalized;
+  }
+
+  // Validate the URL
+  try {
+    new URL(normalized);
+    return normalized;
+  } catch (error) {
+    throw new Error(`Invalid URL: ${url}`);
+  }
+}
+
+// Helper function to create a new browser session
+async function createSession(connectionId: string, ws: ServerWebSocket, tier: string = 'primary'): Promise<string> {
+  if (!sharedBrowser) {
+    throw new Error('Shared browser not initialized');
+  }
+
+  const sessionId = crypto.randomUUID();
+  const selectedTier = QUALITY_TIERS[tier] || QUALITY_TIERS.primary;
+
+  console.log(`[${connectionId}][${sessionId}] Creating new session with ${tier} tier`);
+
+  // Create new context with anti-detection configuration
+  const context = await sharedBrowser.newContext({
+    viewport: { width: selectedTier.width, height: selectedTier.height },
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    deviceScaleFactor: 2,
+    hasTouch: false,
+    colorScheme: 'light',
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  });
+
+  const page = await context.newPage();
+
+  // Inject anti-detection scripts
+  await page.addInitScript(() => {
+    // Remove webdriver flag
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => false,
+    });
+
+    // Add chrome object
+    (window as any).chrome = {
+      runtime: {},
+      loadTimes: function() {},
+      csi: function() {},
+      app: {},
+    };
+
+    // Mock plugins
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [
+        { name: 'Chrome PDF Plugin', length: 1 },
+        { name: 'Chrome PDF Viewer', length: 1 },
+        { name: 'Native Client', length: 1 },
+      ],
+    });
+
+    // Fix languages
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['en-US', 'en'],
+    });
+
+    // Override permissions query
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters: any) => (
+      parameters.name === 'notifications' ?
+        Promise.resolve({ state: (Notification as any).permission } as PermissionStatus) :
+        originalQuery(parameters)
+    );
+  });
+
+  // Get CDP session
+  const cdp = await context.newCDPSession(page);
+
+  // Start screencast
+  const everyNthFrame = Math.max(1, Math.round(30 / selectedTier.fps));
+  await cdp.send('Page.startScreencast', {
+    format: 'jpeg',
+    quality: selectedTier.quality,
+    maxWidth: selectedTier.width,
+    maxHeight: selectedTier.height,
+    everyNthFrame: everyNthFrame,
+  });
+
+  // Listen for frames - include sessionId in frame data
+  cdp.on('Page.screencastFrame', async (event) => {
+    const frameEvent = event as unknown as ScreencastFrameEvent;
+    ws.send(JSON.stringify({
+      type: 'frame',
+      sessionId: sessionId,
+      data: frameEvent.data,
+      metadata: frameEvent.metadata,
+    }));
+
+    // Acknowledge frame
+    await cdp.send('Page.screencastFrameAck', {
+      sessionId: frameEvent.sessionId,
+    });
+  });
+
+  // Store session
+  const session: BrowserSession = {
+    sessionId,
+    connectionId,
+    context,
+    page,
+    cdp,
+    currentTier: tier,
+  };
+
+  sessions.set(sessionId, session);
+  connectionSessions.get(connectionId)?.add(sessionId);
+
+  return sessionId;
+}
+
+// Helper function to close a session
+async function closeSession(sessionId: string): Promise<void> {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    console.warn(`Session ${sessionId} not found`);
+    return;
+  }
+
+  console.log(`[${session.connectionId}][${sessionId}] Closing session`);
+
+  try {
+    await session.cdp.detach();
+    await session.context.close();
+  } catch (error) {
+    console.error(`[${session.connectionId}][${sessionId}] Error closing session:`, error);
+  }
+
+  // Remove from tracking
+  sessions.delete(sessionId);
+  connectionSessions.get(session.connectionId)?.delete(sessionId);
+}
 
 Bun.serve({
   port: PORT,
@@ -116,206 +279,286 @@ Bun.serve({
 
       console.log(`[${connectionId}] WebSocket connected`);
 
-      if (!sharedBrowser) {
-        throw new Error('Shared browser not initialized');
-      }
-
-      // Create new context with anti-detection configuration
-      const primaryTier = QUALITY_TIERS.primary;
-      const context = await sharedBrowser.newContext({
-        viewport: { width: primaryTier.width, height: primaryTier.height },
-        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        locale: 'en-US',
-        timezoneId: 'America/New_York',
-        deviceScaleFactor: 2,
-        hasTouch: false,
-        colorScheme: 'light',
-        extraHTTPHeaders: {
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-      });
-
-      const page = await context.newPage();
-
-      // Inject anti-detection scripts
-      await page.addInitScript(() => {
-        // Remove webdriver flag
-        Object.defineProperty(navigator, 'webdriver', {
-          get: () => false,
-        });
-
-        // Add chrome object
-        (window as any).chrome = {
-          runtime: {},
-          loadTimes: function() {},
-          csi: function() {},
-          app: {},
-        };
-
-        // Mock plugins
-        Object.defineProperty(navigator, 'plugins', {
-          get: () => [
-            { name: 'Chrome PDF Plugin', length: 1 },
-            { name: 'Chrome PDF Viewer', length: 1 },
-            { name: 'Native Client', length: 1 },
-          ],
-        });
-
-        // Fix languages
-        Object.defineProperty(navigator, 'languages', {
-          get: () => ['en-US', 'en'],
-        });
-
-        // Override permissions query
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters: any) => (
-          parameters.name === 'notifications' ?
-            Promise.resolve({ state: (Notification as any).permission } as PermissionStatus) :
-            originalQuery(parameters)
-        );
-      });
-
-      // Get CDP session
-      const cdp = await context.newCDPSession(page);
-
-      // Start screencast with primary tier (best quality for initial load)
-      const everyNthFrame = Math.max(1, Math.round(30 / primaryTier.fps));
-      await cdp.send('Page.startScreencast', {
-        format: 'jpeg',
-        quality: primaryTier.quality,
-        maxWidth: primaryTier.width,
-        maxHeight: primaryTier.height,
-        everyNthFrame: everyNthFrame,
-      });
-
-      // Listen for frames
-      cdp.on('Page.screencastFrame', async (event) => {
-        const frameEvent = event as unknown as ScreencastFrameEvent;
-        ws.send(JSON.stringify({
-          type: 'frame',
-          data: frameEvent.data,
-          metadata: frameEvent.metadata,
-        }));
-
-        // Acknowledge frame
-        await cdp.send('Page.screencastFrameAck', {
-          sessionId: frameEvent.sessionId,
-        });
-      });
-
-      // Store context instance
-      contexts.set(connectionId, { context, page, cdp });
+      // Initialize empty session set for this connection
+      connectionSessions.set(connectionId, new Set());
 
       ws.send(JSON.stringify({
-        type: 'status',
-        message: 'Browser ready',
+        type: 'connected',
+        connectionId,
+        message: 'Ready to create sessions',
       }));
     },
 
     async message(ws, message) {
       const wsWithId = ws as WebSocketWithId;
       const connectionId = wsWithId.connectionId;
-      const contextSession = contexts.get(connectionId);
-
-      if (!contextSession) {
-        throw new Error(`No context session found for ${connectionId}`);
-      }
-
-      const { page, cdp } = contextSession;
-
       const data = JSON.parse(message.toString());
 
-      switch (data.type) {
-        case 'navigate':
-          console.log(`[${connectionId}] Navigating to: ${data.url}`);
-          await page.goto(data.url, {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000
-          });
-          ws.send(JSON.stringify({
-            type: 'status',
-            message: `Navigated to ${data.url}`,
-          }));
-          break;
+      try {
+        switch (data.type) {
+          // Session lifecycle management
+          case 'createSession': {
+            const tier = data.tier || 'primary';
+            const sessionId = await createSession(connectionId, ws, tier);
+            const selectedTier = QUALITY_TIERS[tier];
 
-        // Raw CDP mouse events - perfect fidelity!
-        case 'mousePressed':
-        case 'mouseReleased':
-        case 'mouseMoved':
-          await cdp.send('Input.dispatchMouseEvent', {
-            type: data.type,
-            x: data.x,
-            y: data.y,
-            button: data.button,
-            clickCount: data.clickCount || 1,
-            modifiers: data.modifiers || 0,
-          });
-          break;
-
-        // Raw CDP wheel event - enables Ctrl+zoom, Shift+horizontal automatically!
-        case 'mouseWheel':
-          await cdp.send('Input.dispatchMouseEvent', {
-            type: 'mouseWheel',
-            x: data.x,
-            y: data.y,
-            deltaX: data.deltaX || 0,
-            deltaY: data.deltaY || 0,
-            modifiers: data.modifiers || 0,
-          });
-          break;
-
-        // Raw CDP keyboard events
-        case 'keyDown':
-        case 'keyUp':
-          await cdp.send('Input.dispatchKeyEvent', {
-            type: data.type,
-            key: data.key,
-            code: data.code,
-            text: data.text,
-            modifiers: data.modifiers || 0,
-          });
-          break;
-
-        // Paste - use insertText CDP method
-        case 'paste':
-          await cdp.send('Input.insertText', {
-            text: data.text,
-          });
-          break;
-
-        // Dynamic quality tier switching
-        case 'setQualityTier':
-          const tier = QUALITY_TIERS[data.tier];
-          if (!tier) {
-            console.warn(`[${connectionId}] Unknown quality tier: ${data.tier}`);
+            ws.send(JSON.stringify({
+              type: 'sessionCreated',
+              sessionId,
+              tier,
+              width: selectedTier.width,
+              height: selectedTier.height,
+            }));
+            console.log(`[${connectionId}][${sessionId}] Session created`);
             break;
           }
 
-          const tierEveryNthFrame = Math.max(1, Math.round(30 / tier.fps));
-          console.log(`[${connectionId}] Switching to ${data.tier} tier (${tier.width}x${tier.height} @ ${tier.quality}% quality, ${tier.fps} fps)`);
+          case 'closeSession': {
+            const { sessionId } = data;
+            if (!sessionId) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: 'sessionId required for closeSession',
+              }));
+              break;
+            }
 
-          // Stop current screencast
-          await cdp.send('Page.stopScreencast');
+            await closeSession(sessionId);
+            ws.send(JSON.stringify({
+              type: 'sessionClosed',
+              sessionId,
+            }));
+            break;
+          }
 
-          // Start screencast with new tier settings
-          await cdp.send('Page.startScreencast', {
-            format: 'jpeg',
-            quality: tier.quality,
-            maxWidth: tier.width,
-            maxHeight: tier.height,
-            everyNthFrame: tierEveryNthFrame,
-          });
+          case 'listSessions': {
+            const sessionIds = Array.from(connectionSessions.get(connectionId) || []);
+            ws.send(JSON.stringify({
+              type: 'sessionList',
+              sessions: sessionIds,
+            }));
+            break;
+          }
 
-          ws.send(JSON.stringify({
-            type: 'qualityTierChanged',
-            tier: data.tier,
-            width: tier.width,
-            height: tier.height,
-          }));
-          break;
+          // All other commands require a sessionId
+          case 'navigate': {
+            const { sessionId, url } = data;
+            const session = sessions.get(sessionId);
 
-        default:
-          console.warn(`[${connectionId}] Unknown message type: ${data.type}`);
+            if (!session || session.connectionId !== connectionId) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: `Invalid session: ${sessionId}`,
+              }));
+              break;
+            }
+
+            try {
+              const normalizedUrl = normalizeUrl(url);
+              console.log(`[${connectionId}][${sessionId}] Navigating to: ${normalizedUrl}`);
+              await session.page.goto(normalizedUrl, {
+                waitUntil: 'domcontentloaded',
+                timeout: 30000
+              });
+
+              // Wait a bit more for dynamic content to load
+              await new Promise(resolve => setTimeout(resolve, 500));
+
+              ws.send(JSON.stringify({
+                type: 'navigationComplete',
+                sessionId,
+                url: normalizedUrl,
+              }));
+            } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : 'Navigation failed';
+              console.error(`[${connectionId}][${sessionId}] Navigation error:`, errorMessage);
+              ws.send(JSON.stringify({
+                type: 'error',
+                sessionId,
+                message: errorMessage,
+              }));
+            }
+            break;
+          }
+
+          // Raw CDP mouse events
+          case 'mousePressed':
+          case 'mouseReleased':
+          case 'mouseMoved': {
+            const { sessionId } = data;
+            const session = sessions.get(sessionId);
+
+            if (!session || session.connectionId !== connectionId) {
+              break;
+            }
+
+            await session.cdp.send('Input.dispatchMouseEvent', {
+              type: data.type,
+              x: data.x,
+              y: data.y,
+              button: data.button,
+              clickCount: data.clickCount || 1,
+              modifiers: data.modifiers || 0,
+            });
+            break;
+          }
+
+          // Raw CDP wheel event
+          case 'mouseWheel': {
+            const { sessionId } = data;
+            const session = sessions.get(sessionId);
+
+            if (!session || session.connectionId !== connectionId) {
+              break;
+            }
+
+            await session.cdp.send('Input.dispatchMouseEvent', {
+              type: 'mouseWheel',
+              x: data.x,
+              y: data.y,
+              deltaX: data.deltaX || 0,
+              deltaY: data.deltaY || 0,
+              modifiers: data.modifiers || 0,
+            });
+            break;
+          }
+
+          // Raw CDP keyboard events
+          case 'keyDown':
+          case 'keyUp': {
+            const { sessionId } = data;
+            const session = sessions.get(sessionId);
+
+            if (!session || session.connectionId !== connectionId) {
+              break;
+            }
+
+            await session.cdp.send('Input.dispatchKeyEvent', {
+              type: data.type,
+              key: data.key,
+              code: data.code,
+              text: data.text,
+              modifiers: data.modifiers || 0,
+            });
+            break;
+          }
+
+          // Paste
+          case 'paste': {
+            const { sessionId } = data;
+            const session = sessions.get(sessionId);
+
+            if (!session || session.connectionId !== connectionId) {
+              break;
+            }
+
+            await session.cdp.send('Input.insertText', {
+              text: data.text,
+            });
+            break;
+          }
+
+          // Dynamic quality tier switching
+          case 'setQualityTier': {
+            const { sessionId } = data;
+            const session = sessions.get(sessionId);
+
+            if (!session || session.connectionId !== connectionId) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: `Invalid session: ${sessionId}`,
+              }));
+              break;
+            }
+
+            const tier = QUALITY_TIERS[data.tier];
+            if (!tier) {
+              console.warn(`[${connectionId}][${sessionId}] Unknown quality tier: ${data.tier}`);
+              break;
+            }
+
+            const tierEveryNthFrame = Math.max(1, Math.round(30 / tier.fps));
+            console.log(`[${connectionId}][${sessionId}] Switching to ${data.tier} tier (${tier.width}x${tier.height} @ ${tier.quality}% quality, ${tier.fps} fps)`);
+
+            // Stop current screencast
+            await session.cdp.send('Page.stopScreencast');
+
+            // Start screencast with new tier settings
+            await session.cdp.send('Page.startScreencast', {
+              format: 'jpeg',
+              quality: tier.quality,
+              maxWidth: tier.width,
+              maxHeight: tier.height,
+              everyNthFrame: tierEveryNthFrame,
+            });
+
+            session.currentTier = data.tier;
+
+            ws.send(JSON.stringify({
+              type: 'qualityTierChanged',
+              sessionId,
+              tier: data.tier,
+              width: tier.width,
+              height: tier.height,
+            }));
+            break;
+          }
+
+          // Request an immediate frame from a session
+          case 'requestFrame': {
+            const { sessionId } = data;
+            const session = sessions.get(sessionId);
+
+            if (!session || session.connectionId !== connectionId) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: `Invalid session: ${sessionId}`,
+              }));
+              break;
+            }
+
+            try {
+              // Capture a screenshot using CDP
+              const tier = QUALITY_TIERS[session.currentTier];
+              const screenshot = await session.cdp.send('Page.captureScreenshot', {
+                format: 'jpeg',
+                quality: tier.quality,
+                clip: {
+                  x: 0,
+                  y: 0,
+                  width: tier.width,
+                  height: tier.height,
+                  scale: 1,
+                },
+              }) as { data: string };
+
+              // Get viewport dimensions
+              const viewport = session.page.viewportSize();
+
+              ws.send(JSON.stringify({
+                type: 'frame',
+                sessionId: sessionId,
+                data: screenshot.data,
+                metadata: {
+                  width: viewport?.width || tier.width,
+                  height: viewport?.height || tier.height,
+                },
+              }));
+            } catch (error) {
+              console.error(`[${connectionId}][${sessionId}] Error capturing frame:`, error);
+            }
+            break;
+          }
+
+          default:
+            console.warn(`[${connectionId}] Unknown message type: ${data.type}`);
+        }
+      } catch (error) {
+        console.error(`[${connectionId}] Error handling message:`, error);
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        }));
       }
     },
 
@@ -324,16 +567,19 @@ Bun.serve({
       const connectionId = wsWithId.connectionId;
       console.log(`[${connectionId}] WebSocket disconnected`);
 
-      const contextSession = contexts.get(connectionId);
-      if (contextSession) {
-        try {
-          await contextSession.cdp.detach();
-          await contextSession.context.close();
-        } catch (error) {
-          console.error(`[${connectionId}] Error closing context:`, error);
-        }
-        contexts.delete(connectionId);
+      // Get all sessions for this connection
+      const sessionIds = connectionSessions.get(connectionId);
+
+      if (sessionIds && sessionIds.size > 0) {
+        console.log(`[${connectionId}] Cleaning up ${sessionIds.size} session(s)`);
+
+        // Close all sessions for this connection
+        const closePromises = Array.from(sessionIds).map(sessionId => closeSession(sessionId));
+        await Promise.all(closePromises);
       }
+
+      // Remove connection tracking
+      connectionSessions.delete(connectionId);
     },
   },
 });
