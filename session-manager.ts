@@ -21,14 +21,14 @@ export interface StreamQuality {
 
 export const QUALITY_TIERS: Record<string, StreamQuality> = {
   background: {
-    width: 1920,
-    height: 1200,
+    width: 2880,
+    height: 1800,
     quality: 50,
     fps: 1,
   },
   secondary: {
-    width: 1920,
-    height: 1200,
+    width: 2880,
+    height: 1800,
     quality: 75,
     fps: 15,
   },

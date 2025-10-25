@@ -7,10 +7,20 @@ import { sessions, getCurrentSessionId } from './session-manager.js';
 let statusEl, currentUrlEl, sessionSelector, forkBtn, newSessionBtn;
 let canvas, ctx, loadingEl;
 
-// Browser dimensions
-export let browserWidth = 2880;
-export let browserHeight = 1800;
-export let currentTier = 'primary';
+// Browser dimensions (internal state)
+let _browserWidth = 2880;
+let _browserHeight = 1800;
+let _currentTier = 'primary';
+
+// Export getters for browser dimensions (always returns current value)
+export function getBrowserWidth() { return _browserWidth; }
+export function getBrowserHeight() { return _browserHeight; }
+export function getCurrentTier() { return _currentTier; }
+
+// Export read-only references for backward compatibility
+export let browserWidth = _browserWidth;
+export let browserHeight = _browserHeight;
+export let currentTier = _currentTier;
 
 // View management - maps sessionId to render targets
 const activeViews = new Map(); // sessionId -> { canvas, ctx, render }
@@ -64,8 +74,11 @@ export function registerMainView(sessionId) {
 
       // Update browser dimensions if changed
       if (metadata) {
-        browserWidth = metadata.width || browserWidth;
-        browserHeight = metadata.height || browserHeight;
+        _browserWidth = metadata.width || _browserWidth;
+        _browserHeight = metadata.height || _browserHeight;
+        // Update exported values
+        browserWidth = _browserWidth;
+        browserHeight = _browserHeight;
       }
 
       // Create image from base64
@@ -127,6 +140,10 @@ export function updateSessionSelector(ws) {
 
 // Update browser dimensions and tier
 export function updateBrowserState(width, height, tier) {
+  _browserWidth = width;
+  _browserHeight = height;
+  _currentTier = tier;
+  // Update exported values
   browserWidth = width;
   browserHeight = height;
   currentTier = tier;

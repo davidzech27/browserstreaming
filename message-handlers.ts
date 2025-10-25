@@ -102,7 +102,7 @@ export async function handleMessage(
           // This is much more reliable for complex sites like Google
           await session.page.goto(normalizedUrl, {
             waitUntil: 'domcontentloaded',
-            timeout: 30000
+            timeout: 60000
           });
 
           // Try to wait for load event with a short timeout
@@ -289,9 +289,55 @@ export async function handleMessage(
 
           // Only scroll if the position is different
           if (currentScroll.x !== scrollX || currentScroll.y !== scrollY) {
+            // Disable smooth scrolling and scroll instantly
             await session.page.evaluate((scroll: { x: number; y: number }) => {
-              window.scrollTo(scroll.x, scroll.y);
+              // Save original scroll behavior
+              const htmlElement = document.documentElement;
+              const bodyElement = document.body;
+              const originalHtmlBehavior = htmlElement.style.scrollBehavior;
+              const originalBodyBehavior = bodyElement.style.scrollBehavior;
+
+              // Force instant scrolling
+              htmlElement.style.scrollBehavior = 'auto';
+              bodyElement.style.scrollBehavior = 'auto';
+
+              // Scroll instantly
+              window.scrollTo({
+                left: scroll.x,
+                top: scroll.y,
+                behavior: 'auto'
+              });
+
+              // Restore original behavior
+              htmlElement.style.scrollBehavior = originalHtmlBehavior;
+              bodyElement.style.scrollBehavior = originalBodyBehavior;
             }, { x: scrollX, y: scrollY });
+
+            // Verify scroll completed
+            const finalScroll = await session.page.evaluate(() => ({
+              x: window.scrollX,
+              y: window.scrollY
+            }));
+
+            if (finalScroll.x !== scrollX || finalScroll.y !== scrollY) {
+              console.log(`[${connectionId}][${sessionId}] Scroll position mismatch - requested (${scrollX}, ${scrollY}), got (${finalScroll.x}, ${finalScroll.y})`);
+            }
+
+            // Send scroll complete confirmation
+            ws.send(JSON.stringify({
+              type: 'scrollComplete',
+              sessionId,
+              scrollX: finalScroll.x,
+              scrollY: finalScroll.y,
+            }));
+          } else {
+            // Scroll position didn't change, still send confirmation
+            ws.send(JSON.stringify({
+              type: 'scrollComplete',
+              sessionId,
+              scrollX: currentScroll.x,
+              scrollY: currentScroll.y,
+            }));
           }
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
@@ -424,6 +470,55 @@ export async function handleMessage(
             type: 'error',
             sessionId,
             message: 'Failed to get current URL',
+          }));
+        }
+        break;
+      }
+
+      // Set resolution dynamically
+      case 'setResolution': {
+        const { sessionId, width, height } = data;
+        const session = getSession(sessionId);
+
+        if (!session || session.connectionId !== connectionId) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: `Invalid session: ${sessionId}`,
+          }));
+          break;
+        }
+
+        try {
+          console.log(`[${connectionId}][${sessionId}] Updating resolution to ${width}x${height}`);
+
+          // Update viewport size
+          await session.page.setViewportSize({ width, height });
+
+          // Restart screencast with new resolution
+          const tier = QUALITY_TIERS[session.currentTier];
+          const everyNthFrame = Math.max(1, Math.round(30 / tier.fps));
+
+          await session.cdp.send('Page.stopScreencast');
+          await session.cdp.send('Page.startScreencast', {
+            format: 'jpeg',
+            quality: tier.quality,
+            maxWidth: width,
+            maxHeight: height,
+            everyNthFrame: everyNthFrame,
+          });
+
+          ws.send(JSON.stringify({
+            type: 'resolutionChanged',
+            sessionId,
+            width,
+            height,
+          }));
+        } catch (error) {
+          console.error(`[${connectionId}][${sessionId}] Error setting resolution:`, error);
+          ws.send(JSON.stringify({
+            type: 'error',
+            sessionId,
+            message: 'Failed to set resolution',
           }));
         }
         break;

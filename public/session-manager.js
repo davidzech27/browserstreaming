@@ -165,7 +165,7 @@ export function navigateAndWait(sendFn, sessionId, url) {
         delete window.navigationPromises[sessionId];
         resolve(); // Resolve anyway to continue
       }
-    }, 35000); // 35 seconds (server has 30s timeout + buffer)
+    }, 65000); // 65 seconds (server has 60s timeout + buffer)
   });
 }
 
@@ -202,6 +202,7 @@ export async function replayInteractions(sendFn, setStatusFn, sessionId, url, in
   // Navigate to the checkpoint URL
   if (checkpointUrl) {
     console.log(`Navigating forked session to checkpoint: ${checkpointUrl}`);
+    setStatusFn(`Navigating to ${checkpointUrl}...`, 'connected');
 
     try {
       // Wait for navigation to complete (server will send navigationComplete)
@@ -215,29 +216,65 @@ export async function replayInteractions(sendFn, setStatusFn, sessionId, url, in
     }
   }
 
-  console.log(`Replaying ${interactionsToReplay.length} interactions from checkpoint`);
+  // Filter out scroll-only interactions (mouseWheel events)
+  // Keep all other interactions, but we'll handle scroll positions differently
+  const nonScrollInteractions = interactionsToReplay.filter(int => int.type !== 'mouseWheel');
+
+  console.log(`Replaying ${nonScrollInteractions.length} non-scroll interactions (filtered from ${interactionsToReplay.length} total)`);
+  setStatusFn(`Replaying ${nonScrollInteractions.length} interactions...`, 'connected');
 
   // Add a small delay after navigation to ensure page is stable
   await new Promise(resolve => setTimeout(resolve, 200));
 
+  // Track last scroll position to avoid redundant updates
+  let lastScrollX = 0;
+  let lastScrollY = 0;
+
   // Replay interactions with timestamp-based timing (compressed)
-  for (let i = 0; i < interactionsToReplay.length; i++) {
-    const interaction = interactionsToReplay[i];
+  for (let i = 0; i < nonScrollInteractions.length; i++) {
+    const interaction = nonScrollInteractions[i];
 
-    // Restore scroll position before this interaction if it has one
-    // Skip if scroll position is at origin (0, 0) to avoid unnecessary updates
-    if (interaction.scrollX !== undefined && interaction.scrollY !== undefined &&
-        (interaction.scrollX !== 0 || interaction.scrollY !== 0)) {
-      console.log(`Restoring scroll position to (${interaction.scrollX}, ${interaction.scrollY}) before ${interaction.type}`);
-      sendFn({
-        type: 'setScrollPosition',
-        sessionId,
-        scrollX: interaction.scrollX,
-        scrollY: interaction.scrollY,
-      });
+    // Before replaying this interaction, jump directly to its scroll position
+    // This skips all intermediate scroll events
+    if (interaction.scrollX !== undefined && interaction.scrollY !== undefined) {
+      // Only update if scroll position changed
+      if (interaction.scrollX !== lastScrollX || interaction.scrollY !== lastScrollY) {
+        console.log(`Jumping to scroll position (${interaction.scrollX}, ${interaction.scrollY}) before ${interaction.type}`);
 
-      // Small delay to let scroll complete
-      await new Promise(resolve => setTimeout(resolve, 50));
+        // Create a promise to wait for scroll to complete
+        const scrollPromise = new Promise((resolve) => {
+          const scrollCallback = (data) => {
+            if (data.type === 'scrollComplete' && data.sessionId === sessionId) {
+              resolve();
+            }
+          };
+
+          // Set up temporary listener
+          if (!window.scrollCompleteCallbacks) {
+            window.scrollCompleteCallbacks = new Map();
+          }
+          window.scrollCompleteCallbacks.set(sessionId, resolve);
+
+          // Timeout after 100ms in case we don't get confirmation
+          setTimeout(resolve, 100);
+        });
+
+        sendFn({
+          type: 'setScrollPosition',
+          sessionId,
+          scrollX: interaction.scrollX,
+          scrollY: interaction.scrollY,
+        });
+
+        lastScrollX = interaction.scrollX;
+        lastScrollY = interaction.scrollY;
+
+        // Wait for scroll to complete (or timeout)
+        await scrollPromise;
+
+        // Additional small delay to ensure rendering is complete
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
     }
 
     // Create a copy and update sessionId
@@ -254,9 +291,9 @@ export async function replayInteractions(sendFn, setStatusFn, sessionId, url, in
     sendFn(replayData);
 
     // Use actual timestamps with compression for more natural replay
-    if (i < interactionsToReplay.length - 1) {
+    if (i < nonScrollInteractions.length - 1) {
       const currentTimestamp = interaction.timestamp || 0;
-      const nextTimestamp = interactionsToReplay[i + 1].timestamp || 0;
+      const nextTimestamp = nonScrollInteractions[i + 1].timestamp || 0;
 
       // Calculate actual time difference
       const actualDelay = nextTimestamp - currentTimestamp;
@@ -268,8 +305,7 @@ export async function replayInteractions(sendFn, setStatusFn, sessionId, url, in
     }
   }
 
-  console.log('Replay complete');
-  setStatusFn('Fork complete', 'connected');
+  console.log('Replay complete - fork ready for interaction');
 }
 
 // Switch to a different session

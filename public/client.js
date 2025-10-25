@@ -25,9 +25,9 @@ import {
   unregisterView,
   updateBrowserState,
   getUIElements,
-  browserWidth,
-  browserHeight,
-  currentTier,
+  getBrowserWidth,
+  getBrowserHeight,
+  getCurrentTier,
 } from './ui-manager.js';
 
 import {
@@ -46,8 +46,8 @@ let ws = null;
 
 // Quality tier tracking
 const TIER_CONFIGS = {
-  background: { width: 1920, height: 1200 },
-  secondary: { width: 1920, height: 1200 },
+  background: { width: 2880, height: 1800 },
+  secondary: { width: 2880, height: 1800 },
   primary: { width: 2880, height: 1800 },
 };
 
@@ -96,11 +96,33 @@ function connect() {
           sessionObj.url = fork.url;
           sessionObj.interactionHistory = [...fork.interactions];
 
-          // Replay interactions on the new session
-          await replayInteractions(send, setStatus, sessionId, fork.url, fork.interactions);
+          // Switch to the forked session immediately so user can see the replay
+          setCurrentSessionId(sessionId);
+          updateBrowserState(data.width, data.height, data.tier);
+          setInteractionHistory([...fork.interactions]);
+          resetMouseMoveCounter();
 
-          // Don't switch to the forked session automatically
+          // Register this session to the main view
+          registerMainView(sessionId);
+
+          console.log(`✓ Switched to forked session: ${sessionId.substring(0, 8)} - Replaying...`);
+          setStatus(`Forked session ${sessionId.substring(0, 8)} - Replaying interactions...`, 'connected');
           updateSessionSelector(ws);
+          updateUrlDisplay(fork.url);
+
+          // Disable navigation during replay
+          navigateBtn.disabled = true;
+
+          // Replay interactions on the new session (async, in background)
+          replayInteractions(send, setStatus, sessionId, fork.url, fork.interactions).then(() => {
+            console.log('Fork replay complete');
+            // Send message indicating fork is complete
+            send({ type: 'forkComplete', sessionId });
+          }).catch((error) => {
+            console.error('Fork replay error:', error);
+            setStatus('Fork replay failed', 'error');
+            navigateBtn.disabled = false;
+          });
         } else {
           // Normal session creation - switch to it
           setCurrentSessionId(sessionId);
@@ -262,6 +284,25 @@ function connect() {
           callback(data.url);
         }
         break;
+
+      case 'forkComplete':
+        console.log(`Fork complete for session ${data.sessionId?.substring(0, 8)}`);
+
+        // Re-enable navigation if this is the current session
+        if (data.sessionId === getCurrentSessionId()) {
+          setStatus(`Active: Session ${data.sessionId.substring(0, 8)} | Ready for interaction`, 'connected');
+          navigateBtn.disabled = false;
+        }
+        break;
+
+      case 'scrollComplete':
+        // Handle scroll complete confirmations
+        if (window.scrollCompleteCallbacks && window.scrollCompleteCallbacks.has(data.sessionId)) {
+          const callback = window.scrollCompleteCallbacks.get(data.sessionId);
+          window.scrollCompleteCallbacks.delete(data.sessionId);
+          callback();
+        }
+        break;
     }
   };
 
@@ -307,8 +348,9 @@ function requestFrame(sessionId) {
 // Switch quality tier
 function setQualityTier(tier) {
   const currentSessionId = getCurrentSessionId();
-  if (tier !== currentTier && currentSessionId) {
-    console.log(`Switching quality tier: ${currentTier} → ${tier}`);
+  const currentTierValue = getCurrentTier();
+  if (tier !== currentTierValue && currentSessionId) {
+    console.log(`Switching quality tier: ${currentTierValue} → ${tier}`);
     send({ type: 'setQualityTier', sessionId: currentSessionId, tier });
   }
 }
@@ -318,6 +360,49 @@ initializeUI();
 
 // Get UI elements after initialization
 const { canvas, sessionSelector, forkBtn, newSessionBtn } = getUIElements();
+const extractTextBtn = document.getElementById('extractTextBtn');
+const clickElementBtn = document.getElementById('clickElementBtn');
+const elementIdInput = document.getElementById('elementIdInput');
+const linksList = document.getElementById('linksList');
+
+// Dynamic resolution adjustment based on canvas display size
+function updateResolution() {
+  const currentSessionId = getCurrentSessionId();
+  if (!currentSessionId) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const displayWidth = Math.round(rect.width * window.devicePixelRatio);
+  const displayHeight = Math.round(rect.height * window.devicePixelRatio);
+
+  // Get current dimensions
+  const currentWidth = getBrowserWidth();
+  const currentHeight = getBrowserHeight();
+
+  // Only update if resolution changed significantly (more than 50px difference)
+  if (Math.abs(displayWidth - currentWidth) > 50 || Math.abs(displayHeight - currentHeight) > 50) {
+    console.log(`Canvas display size changed: ${displayWidth}x${displayHeight} (was ${currentWidth}x${currentHeight})`);
+
+    // Send resolution update to server
+    send({
+      type: 'setResolution',
+      sessionId: currentSessionId,
+      width: displayWidth,
+      height: displayHeight,
+    });
+
+    // Update local browser dimensions
+    updateBrowserState(displayWidth, displayHeight, getCurrentTier());
+  }
+}
+
+// Monitor canvas size changes
+const resizeObserver = new ResizeObserver(() => {
+  updateResolution();
+});
+resizeObserver.observe(canvas);
+
+// Initial resolution update
+setTimeout(updateResolution, 1000);
 
 // Quality tier management based on focus and visibility
 window.addEventListener('focus', () => {
@@ -380,6 +465,132 @@ sessionSelector.addEventListener('change', (e) => {
     }
   } else {
     console.warn('Invalid session selected:', selectedSessionId);
+  }
+});
+
+// Extract Text button handler
+extractTextBtn.addEventListener('click', async () => {
+  const currentSessionId = getCurrentSessionId();
+  if (!currentSessionId) {
+    console.warn('No active session - cannot extract text');
+    setStatus('No active session', 'error');
+    return;
+  }
+
+  console.log(`Extracting text from session ${currentSessionId.substring(0, 8)}...`);
+  setStatus('Extracting text...', 'connected');
+  extractTextBtn.disabled = true;
+
+  try {
+    const response = await fetch('/api/extract-text', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ sessionId: currentSessionId }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to extract text');
+    }
+
+    const data = await response.json();
+
+    console.log('=== PAGE TEXT EXTRACTION ===');
+    console.log(`Title: ${data.title}`);
+    console.log(`URL: ${data.url}`);
+    console.log(`Text Content Length: ${data.summary.characterCount} characters`);
+    console.log(`Links Found: ${data.summary.uniqueLinks} unique (${data.summary.totalLinks} total)`);
+    console.log('\n--- Formatted Output (LLM-friendly) ---\n');
+    console.log(data.formatted);
+    console.log('\n--- Raw Data (JSON) ---');
+    console.log(data);
+    console.log('=== END EXTRACTION ===');
+
+    // Update UI with links
+    displayLinks(data.uniqueLinks);
+
+    setStatus(`Text extracted: ${data.summary.characterCount} chars, ${data.summary.uniqueLinks} links`, 'connected');
+  } catch (error) {
+    console.error('Error extracting text:', error);
+    setStatus(`Extraction failed: ${error.message}`, 'error');
+  } finally {
+    extractTextBtn.disabled = false;
+  }
+});
+
+// Display links in the UI
+function displayLinks(uniqueLinks) {
+  if (!linksList) return;
+
+  if (!uniqueLinks || uniqueLinks.length === 0) {
+    linksList.className = 'element-list empty';
+    linksList.textContent = 'No links found';
+    return;
+  }
+
+  linksList.className = 'element-list';
+  linksList.innerHTML = '';
+
+  uniqueLinks.forEach(link => {
+    const item = document.createElement('div');
+    item.className = 'element-item link';
+    const text = link.texts[0]?.substring(0, 60) || '[no text]';
+    const variants = link.texts.length > 1 ? ` (+${link.texts.length - 1})` : '';
+    item.textContent = `[${link.firstId}] ${text}${variants}`;
+    item.title = link.url;
+    item.onclick = () => {
+      elementIdInput.value = link.firstId;
+    };
+    linksList.appendChild(item);
+  });
+}
+
+// Click element handler
+clickElementBtn.addEventListener('click', async () => {
+  const currentSessionId = getCurrentSessionId();
+  const elementId = elementIdInput.value.trim();
+
+  if (!currentSessionId) {
+    console.warn('No active session - cannot click element');
+    setStatus('No active session', 'error');
+    return;
+  }
+
+  if (!elementId) {
+    console.warn('No element ID provided');
+    setStatus('Enter an element ID', 'error');
+    return;
+  }
+
+  console.log(`Clicking element ${elementId}...`);
+  setStatus(`Clicking ${elementId}...`, 'connected');
+  clickElementBtn.disabled = true;
+
+  try {
+    const response = await fetch('/api/click-element', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ sessionId: currentSessionId, elementId }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to click element');
+    }
+
+    const data = await response.json();
+
+    console.log('✓ Element clicked:', data);
+    setStatus(`Clicked ${elementId}: ${data.text}`, 'connected');
+  } catch (error) {
+    console.error('Error clicking element:', error);
+    setStatus(`Click failed: ${error.message}`, 'error');
+  } finally {
+    clickElementBtn.disabled = false;
   }
 });
 

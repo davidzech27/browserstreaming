@@ -2,7 +2,7 @@
 // Handles keyboard, mouse, and other input events
 
 import { getCurrentSessionId, recordWithSampling, handleNavigation } from './session-manager.js';
-import { browserWidth, browserHeight, updateUrlDisplay } from './ui-manager.js';
+import { getBrowserWidth, getBrowserHeight, updateUrlDisplay } from './ui-manager.js';
 
 // Canvas focus state
 let canvasFocused = false;
@@ -10,11 +10,21 @@ let canvasFocused = false;
 // Get scaled coordinates (canvas -> browser viewport)
 function getScaledCoordinates(canvas, event) {
   const rect = canvas.getBoundingClientRect();
-  const scaleX = browserWidth / rect.width;
-  const scaleY = browserHeight / rect.height;
 
-  const x = (event.clientX - rect.left) * scaleX;
-  const y = (event.clientY - rect.top) * scaleY;
+  // First, get the mouse position relative to the canvas display area (0 to rect.width/height)
+  const canvasX = event.clientX - rect.left;
+  const canvasY = event.clientY - rect.top;
+
+  // Then scale from canvas display coordinates to canvas internal coordinates
+  const internalX = (canvasX / rect.width) * canvas.width;
+  const internalY = (canvasY / rect.height) * canvas.height;
+
+  // Finally, scale from canvas internal coordinates to browser viewport coordinates
+  const scaleX = getBrowserWidth() / canvas.width;
+  const scaleY = getBrowserHeight() / canvas.height;
+
+  const x = internalX * scaleX;
+  const y = internalY * scaleY;
 
   return { x, y };
 }
