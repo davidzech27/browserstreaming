@@ -3,38 +3,76 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const urlInput = document.getElementById('urlInput');
 const navigateBtn = document.getElementById('navigateBtn');
+const cloneBtn = document.getElementById('cloneBtn');
+const snapshotBtn = document.getElementById('snapshotBtn');
 const statusEl = document.getElementById('status');
 const loadingEl = document.getElementById('loading');
+const recordingStatusEl = document.getElementById('recordingStatus');
+const eventCountEl = document.getElementById('eventCount');
+const cacheSizeEl = document.getElementById('cacheSize');
 
 // WebSocket connection
 let ws = null;
-let browserWidth = 2880;
-let browserHeight = 1800;
+const MACBOOK_VIEWPORT = {
+  width: 1512,
+  height: 982,
+};
+
+let viewportWidth = MACBOOK_VIEWPORT.width;
+let viewportHeight = MACBOOK_VIEWPORT.height;
+let streamWidth = MACBOOK_VIEWPORT.width;
+let streamHeight = MACBOOK_VIEWPORT.height;
+let serverReady = false;
+let messageQueue = [];
 
 // Quality tier tracking
 let currentTier = 'primary';
-const TIER_CONFIGS = {
-  background: { width: 1920, height: 1200 },
-  secondary: { width: 1920, height: 1200 },
-  primary: { width: 2880, height: 1800 },
-};
 
 // Connect to WebSocket
 function connect() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+  // Check if we're reconnecting to an existing session
+  const urlParams = new URLSearchParams(window.location.search);
+  const sessionId = urlParams.get('sessionId');
+
+  const wsUrl = sessionId
+    ? `${protocol}//${window.location.host}/ws?sessionId=${sessionId}`
+    : `${protocol}//${window.location.host}/ws`;
 
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
-    setStatus('Connected', 'connected');
-    navigateBtn.disabled = false;
+    // Reset state for new connection
+    serverReady = false;
+    messageQueue = [];
+    setStatus('Initializing...', '');
+    // navigateBtn will be enabled when 'ready' message arrives
   };
 
   ws.onmessage = async (event) => {
     const data = JSON.parse(event.data);
 
     switch (data.type) {
+      case 'ready':
+        console.log('[Client] Server ready! Flushing', messageQueue.length, 'queued messages');
+        serverReady = true;
+        if (data.viewport?.width && data.viewport?.height) {
+          viewportWidth = data.viewport.width;
+          viewportHeight = data.viewport.height;
+          resizeCanvas(viewportWidth, viewportHeight);
+        }
+
+        // Flush all queued messages
+        while (messageQueue.length > 0) {
+          const queuedMsg = messageQueue.shift();
+          ws.send(JSON.stringify(queuedMsg));
+        }
+
+        setStatus('Connected', 'connected');
+        navigateBtn.disabled = false;
+        break;
+
       case 'frame':
         await renderFrame(data.data, data.metadata);
         break;
@@ -50,8 +88,41 @@ function connect() {
 
       case 'qualityTierChanged':
         console.log(`Quality tier changed to: ${data.tier} (${data.width}x${data.height})`);
-        browserWidth = data.width;
-        browserHeight = data.height;
+        streamWidth = data.width;
+        streamHeight = data.height;
+        break;
+
+      case 'cloneProgress':
+        console.log(`Clone progress: ${data.stage} (${data.progress}%)`);
+        setStatus(`Cloning: ${data.message || data.stage}`, 'connected');
+        break;
+
+      case 'cloneCreated':
+        console.log('Clone created!', data);
+        setStatus('Clone created!', 'connected');
+        // Open clone in new window
+        const cloneUrl = `${window.location.origin}/?sessionId=${data.targetConnectionId}`;
+        window.open(cloneUrl, '_blank');
+        break;
+
+      case 'snapshotCaptured':
+        console.log('Snapshot captured:', data);
+        setStatus(
+          `Snapshot captured (${data.snapshot.viewport.width}x${data.snapshot.viewport.height})`,
+          'connected'
+        );
+        setTimeout(() => setStatus('Connected', 'connected'), 3000);
+        break;
+
+      case 'cacheStats':
+        updateStats(data.stats, data.eventsRecorded);
+        break;
+
+      case 'recordingStatus':
+        recordingStatusEl.textContent = data.isRecording ? 'Yes' : 'No';
+        if (data.eventsRecorded !== undefined) {
+          eventCountEl.textContent = data.eventsRecorded;
+        }
         break;
     }
   };
@@ -62,6 +133,8 @@ function connect() {
   };
 
   ws.onclose = () => {
+    serverReady = false;
+    messageQueue = [];
     setStatus('Disconnected', 'error');
     navigateBtn.disabled = true;
 
@@ -81,8 +154,8 @@ async function renderFrame(base64Data, metadata) {
 
   // Update browser dimensions if changed
   if (metadata) {
-    browserWidth = metadata.width || browserWidth;
-    browserHeight = metadata.height || browserHeight;
+    streamWidth = metadata.width || streamWidth;
+    streamHeight = metadata.height || streamHeight;
   }
 
   // Create image from base64
@@ -96,7 +169,14 @@ async function renderFrame(base64Data, metadata) {
 // Send message to server
 function send(data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(data));
+    if (serverReady) {
+      // Server is ready, send immediately
+      ws.send(JSON.stringify(data));
+    } else {
+      // Server not ready yet, queue the message
+      messageQueue.push(data);
+      console.log('[Client] Queued message (server not ready):', data.type);
+    }
   }
 }
 
@@ -106,11 +186,21 @@ function setStatus(message, className) {
   statusEl.className = `status ${className}`;
 }
 
+// Update stats display
+function updateStats(stats, eventsRecorded) {
+  if (stats) {
+    cacheSizeEl.textContent = stats.entries || 0;
+  }
+  if (eventsRecorded !== undefined) {
+    eventCountEl.textContent = eventsRecorded;
+  }
+}
+
 // Get scaled coordinates (canvas -> browser viewport)
 function getScaledCoordinates(event) {
   const rect = canvas.getBoundingClientRect();
-  const scaleX = browserWidth / rect.width;
-  const scaleY = browserHeight / rect.height;
+  const scaleX = viewportWidth / rect.width;
+  const scaleY = viewportHeight / rect.height;
 
   const x = (event.clientX - rect.left) * scaleX;
   const y = (event.clientY - rect.top) * scaleY;
@@ -169,6 +259,34 @@ urlInput.addEventListener('keypress', (e) => {
     navigateBtn.click();
   }
 });
+
+// Clone button - clone current session
+cloneBtn.addEventListener('click', () => {
+  console.log('Cloning session...');
+  cloneBtn.disabled = true;
+  send({
+    type: 'cloneSession',
+    options: {
+      playbackSpeed: 0,  // Instant replay
+      skipAnimations: true,
+    }
+  });
+  // Re-enable after a delay
+  setTimeout(() => {
+    cloneBtn.disabled = false;
+  }, 2000);
+});
+
+// Snapshot button - capture current state
+snapshotBtn.addEventListener('click', () => {
+  console.log('Capturing snapshot...');
+  send({ type: 'captureSnapshot' });
+});
+
+// Periodically request cache stats
+setInterval(() => {
+  send({ type: 'getCacheStats' });
+}, 2000);
 
 // Mouse events - send raw CDP-compatible events
 canvas.addEventListener('mousedown', (e) => {
@@ -269,8 +387,8 @@ canvas.addEventListener('wheel', (e) => {
     type: 'mouseWheel',
     x,
     y,
-    deltaX: e.deltaX * 0.1,  // Scale down for natural scroll speed
-    deltaY: e.deltaY * 0.1,  // Scale down for natural scroll speed
+    deltaX: e.deltaX,  // Scale down for natural scroll speed
+    deltaY: e.deltaY,  // Scale down for natural scroll speed
     modifiers: getModifiers(e),  // Enables Ctrl+scroll zoom!
   });
 }, { passive: false });
@@ -297,7 +415,7 @@ const visibilityObserver = new IntersectionObserver((entries) => {
     } else if (!canvasFocused) {
       // Partially visible but not focused
       setQualityTier('secondary');
-    } {
+    } else {
       // Visible and focused
       setQualityTier('primary');
     }
@@ -309,5 +427,13 @@ const visibilityObserver = new IntersectionObserver((entries) => {
 // Start observing canvas visibility
 visibilityObserver.observe(canvas);
 
+function resizeCanvas(width, height) {
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+}
+
 // Initialize connection
+resizeCanvas(viewportWidth, viewportHeight);
 connect();

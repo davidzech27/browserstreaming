@@ -71,6 +71,7 @@
     .status {
       font-size: 12px;
       color: #888;
+      margin-bottom: 5px;
     }
 
     .status.connected {
@@ -79,6 +80,17 @@
 
     .status.error {
       color: #ff4444;
+    }
+
+    .stats {
+      font-size: 11px;
+      color: #666;
+      font-family: 'Monaco', 'Courier New', monospace;
+    }
+
+    .stats span {
+      color: #00ff88;
+      font-weight: 600;
     }
 
     .viewport {
@@ -118,12 +130,19 @@
           value="https://example.com"
         >
         <button id="navigateBtn">Navigate</button>
+        <button id="cloneBtn" title="Clone this tab with all state">Clone Tab</button>
+        <button id="snapshotBtn" title="Capture current state">Snapshot</button>
       </div>
       <div class="status" id="status">Connecting...</div>
+      <div class="stats" id="stats">
+        Recording: <span id="recordingStatus">Yes</span> |
+        Events: <span id="eventCount">0</span> |
+        Cache: <span id="cacheSize">0</span> entries
+      </div>
     </div>
 
     <div class="viewport">
-      <canvas id="canvas" width="2880" height="1800"></canvas>
+      <canvas id="canvas" width="1512" height="982"></canvas>
       <div class="loading" id="loading">Waiting for stream...</div>
     </div>
   </div>

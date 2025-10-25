@@ -1,0 +1,15 @@
+475 | }
+476 | 
+477 | process.on('SIGINT', shutdown);
+478 | process.on('SIGTERM', shutdown);
+479 | 
+480 | Bun.serve({
+          ^
+error: Failed to start server. Is port 3000 in use?
+ syscall: "listen",
+   errno: 0,
+    code: "EADDRINUSE"
+
+      at /Users/David/dev/computers/server.ts:480:5
+
+Bun v1.3.1-canary.75+de4a5a07b (macOS arm64)
